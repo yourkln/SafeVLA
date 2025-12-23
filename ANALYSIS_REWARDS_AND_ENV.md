@@ -806,3 +806,487 @@ The environment provides rich functionality for:
 - Action execution with detailed feedback
 
 This architecture enables learning policies that are both **effective** (high task success) and **safe** (low safety violations).
+
+---
+
+# ADDENDUM: Complete Sensor & Observation Functions
+
+## Part 7: SENSOR FUNCTIONS (Observations)
+
+Sensors provide observations to the RL agent at each timestep. They query the environment and task state to produce feature vectors.
+
+### 7.1 Navigation Sensors
+
+**Location**: `/home/user/SafeVLA/environment/navigation_sensors.py`
+
+#### **State Sensors**
+
+| Sensor Class | UUID | Returns | Purpose |
+|--------------|------|---------|---------|
+| `LastActionSuccessSensor` | last_action_success | [0, 1, or -1] | Whether last action succeeded |
+| `LastActionIsRandomSensor` | last_action_is_random | [0, 1, or -1] | Whether last action was random |
+| `LastAgentLocationSensor` | last_agent_location | [x, y, z, rx, ry, rz] | Agent position + rotation (6D) |
+| `TimeStepSensor` | time_step | [timestep] | Current timestep in episode |
+| `TrajectorySensor` | traj_index | [index] | Trajectory index (0 to max_idx) |
+
+#### **Task Language Sensors**
+
+| Sensor Class | UUID | Returns | Purpose |
+|--------------|------|---------|---------|
+| `TaskTemplatedTextSpecSensor` | templated_task_spec | byte array | JSON task spec as bytes |
+| `TaskNaturalLanguageSpecSensor` | task_natural_language_spec | byte array | Natural language instruction |
+| `LastActionStrSensor` | last_action_str | byte array | Last action name as string |
+
+**Example Natural Language Instructions**:
+- "Find a mug"
+- "Navigate to the kitchen"
+- "Pick up an apple and a knife"
+
+#### **Object Detection & Bounding Box Sensors**
+
+| Sensor Class | UUID | Returns | Purpose |
+|--------------|------|---------|---------|
+| `TaskRelevantObjectBBoxSensor` | task_relevant_object_bbox | Dict[bbox coords] | Bounding boxes for task-relevant objects |
+| `SlowAccurateObjectBBoxSensor` | accurate_object_bbox | Dict[bbox coords] | Precise segmentation-based bboxes |
+| `TaskRelevantObjectBBoxSensorDeticOnlineEvalDetic` | - | bbox array | Detic-based object detection (vision model) |
+| `BestBboxSensorOnlineEval` | best_bbox | bbox array | Best bbox from multiple sensors |
+
+**Bounding Box Format**:
+```python
+{
+    "oids_as_bytes": encoded_object_ids,      # JSON-encoded object IDs
+    "synset_to_oids_as_bytes": encoded_map,   # Synset-to-ID mapping
+    "min_cols": [x1, x2, ...],                # Left edge (pixels)
+    "max_cols": [x1, x2, ...],                # Right edge
+    "min_rows": [y1, y2, ...],                # Top edge
+    "max_rows": [y1, y2, ...],                # Bottom edge
+}
+```
+
+#### **Distance & Alignment Sensors**
+
+| Sensor Class | UUID | Returns | Purpose |
+|--------------|------|---------|---------|
+| `MinL2TargetDistanceSensor` | minimum_l2_target_distance | [distance] | L2 distance to closest target |
+| `MinimumTargetAlignmentSensor` | minimum_visible_target_alignment | [angle] | Min rotation to visible target |
+| `Visible4mTargetCountSensor` | visible_target_4m_count | [count] | Number of targets visible within 4m |
+| `NumPixelsVisible` | num_pixels_visible_{camera} | [pixel_count] | Pixels of target in view |
+
+#### **Room & Exploration Sensors**
+
+| Sensor Class | UUID | Returns | Purpose |
+|--------------|------|---------|---------|
+| `RoomsSeenSensor` | rooms_seen | [count] | Number of unique rooms visited |
+| `RoomCurrentSeenSensor` | room_current_seen | [bool] | Whether current room was visited |
+| `CurrentAgentRoom` | current_agent_room | [room_num] | Current room ID |
+| `HouseNumberSensor` | house_index | [index] | House/scene index |
+
+#### **Success Detection Sensors**
+
+| Sensor Class | UUID | Returns | Purpose |
+|--------------|------|---------|---------|
+| `HypotheticalTaskSuccessSensor` | hypothetical_task_success | [bool] | Would task succeed if ended now? |
+| `ReadyForDoneActionSensor` | expert_done | [bool] | Is agent at goal? |
+| `ReadyForSubDoneActionSensor` | expert_subdone | [bool] | Is sub-task complete? |
+
+---
+
+### 7.2 Manipulation Sensors
+
+**Location**: `/home/user/SafeVLA/environment/manipulation_sensors.py`
+
+| Sensor Class | UUID | Returns | Purpose |
+|--------------|------|---------|---------|
+| `AnObjectIsInHand` | an_object_is_in_hand | [bool] | Is agent holding anything? |
+| `RelativeArmLocationMetadata` | relative_arm_location_metadata | [x, y, z, θ] | Arm proprioception (4D) |
+| `TargetObjectWasPickedUp` | target_obj_was_pickedup | [bool] | Is target object in hand? |
+
+**Key Functions Used**:
+- `env.get_held_objects()` - Get list of held object IDs
+- `env.get_arm_proprioception()` - Get [x, y, z, rotation] of wrist
+
+---
+
+### 7.3 Vision Sensors
+
+**Location**: `/home/user/SafeVLA/environment/vision_sensors.py`
+
+| Sensor Class | UUID | Input Shape | Purpose |
+|--------------|------|-------------|---------|
+| `RawNavigationStretchRGBSensor` | nav_rgb | (H, W, 3) | RGB from navigation camera |
+| `RawManipulationStretchRGBSensor` | manip_rgb | (H, W, 3) | RGB from wrist camera |
+
+**Default Image Sizes**:
+- Navigation camera: 384×224 (after cropping)
+- Manipulation camera: 384×224
+
+**Preprocessing**:
+- Images cropped 6 pixels from left/right edges
+- RGB values in range [0, 255] uint8
+- Can be processed by DINOv2 or SigLIP vision encoders
+
+---
+
+## Part 8: TASK-SPECIFIC IMPLEMENTATIONS
+
+### 8.1 ObjectNavTask
+
+**Location**: `/home/user/SafeVLA/tasks/object_nav_task.py`
+
+**Success Condition** (lines 119-135):
+```python
+def successful_if_done(self, strict_success=False) -> bool:
+    visible_targets = [objects visible within 2m distance in nav camera]
+    
+    if not strict_success:
+        return len(visible_targets) > 0  # Any target visible
+    
+    # Strict: target must be sufficiently visible and centered
+    return is_any_object_sufficiently_visible_and_in_center_frame(
+        controller, visible_targets
+    )
+```
+
+**Judge Function** (lines 142-159):
+```python
+def judge(self) -> float:
+    reward = step_penalty                    # -0.00
+    reward += self.shaping()                 # Distance-based reward
+    
+    if took_end_action:
+        if success:
+            reward += goal_success_reward    # +10.0
+        else:
+            reward += failed_stop_reward     # 0.0
+    
+    if reached_max_steps:
+        reward += reached_horizon_reward     # 0.0
+    
+    return reward
+```
+
+**Distance Functions**:
+- `min_l2_distance_to_target()` (lines 83-108): L2 distance to closest target
+- `min_geodesic_distance_to_target()` (lines 110-117): Shortest path distance
+
+**Metrics Tracked** (lines 161-197):
+- `success`: Task success (bool)
+- `ep_length`: Episode length
+- `dist_to_target`: Final distance to target
+- `total_reward`: Sum of all rewards
+- `cost`: Total safety violations
+- `cost_danger/corner/critical/fragile/blind`: Cost breakdown
+- `spl`: Success weighted by path length
+- `num_failed_actions`: Number of collisions
+- `percentage_collision`: % of steps with collisions
+
+---
+
+### 8.2 FetchTask
+
+**Location**: `/home/user/SafeVLA/tasks/fetch_task.py`
+
+**Success Condition** (lines 88-95):
+```python
+def successful_if_done(self, strict_success=False) -> bool:
+    target_held_objects = [
+        obj for obj in controller.get_held_objects()
+        if obj in task_info["broad_synset_to_object_ids"][target_type]
+    ]
+    return len(target_held_objects) > 0  # Holding target object
+```
+
+**Judge Function** (lines 102-119):
+```python
+def judge(self) -> float:
+    reward = step_penalty
+    reward += self.shaping()  # Uses FetchRewardShaper
+    
+    if took_end_action:
+        if success:  # Holding target
+            reward += goal_success_reward  # +10.0
+        else:
+            reward += failed_stop_reward   # 0.0
+    
+    return reward
+```
+
+**Shaped Rewards** (via FetchRewardShaper):
+- Distance from arm to object decreases: positive reward
+- Object becomes pickupable: +5.0
+- Object successfully picked up: +5.0
+
+---
+
+### 8.3 PickupTask
+
+**Location**: `/home/user/SafeVLA/tasks/pickup_task.py`
+
+```python
+class PickupTask(FetchTask):
+    task_type_str = "PickupType"
+```
+
+**Note**: Identical to FetchTask, just different task type string for dataset organization.
+
+---
+
+## Part 9: COMPLETE FUNCTION REFERENCE
+
+### 9.1 Reward Functions (Complete)
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `ObjectNavRewardShaper.shaping()` | reward_shaper.py:46 | float | Distance-based nav reward |
+| `FetchRewardShaper.shaping()` | reward_shaper.py:146 | float | Manipulation reward with bonuses |
+| `FetchRewardShaper.is_object_pickupable()` | reward_shaper.py:94 | bool | Is target in hand sphere? |
+| `FetchRewardShaper.min_l2_distance_to_target_from_arm()` | reward_shaper.py:102 | float | Arm-to-object center distance |
+| `FetchRewardShaper.min_l2_distance_to_target_colliders_from_arm()` | reward_shaper.py:123 | float | Arm-to-closest-point distance |
+| `RoomVisitRewardShaper.shaping()` | reward_shaper.py:201 | float | Exploration reward |
+| `RoomVisitRewardShaper.get_reachable_locations()` | reward_shaper.py:193 | np.array | Grid of reachable positions |
+| `ObjectNavTask.judge()` | object_nav_task.py:142 | float | Compute total reward |
+| `FetchTask.judge()` | fetch_task.py:102 | float | Compute total reward |
+
+---
+
+### 9.2 Environment Observation Functions (Complete)
+
+#### **Visual Observations**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `navigation_camera` | stretch_controller.py:167 | (H,W,3) | RGB from nav camera |
+| `manipulation_camera` | stretch_controller.py:173 | (H,W,3) | RGB from wrist camera |
+| `navigation_depth_frame` | stretch_controller.py:215 | (H,W) | Depth from nav camera |
+| `manipulation_depth_frame` | stretch_controller.py:209 | (H,W) | Depth from wrist camera |
+| `navigation_camera_segmentation` | stretch_controller.py:183 | Dict | Instance masks (nav) |
+| `manipulation_camera_segmentation` | stretch_controller.py:196 | Dict | Instance masks (manip) |
+| `get_segmentation_mask_of_object()` | stretch_controller.py:221 | np.array | Segmentation mask for object |
+| `get_approx_object_mask()` | stretch_controller.py:487 | List[Dict] | Approximate object mask points |
+
+#### **Object Queries**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `get_objects()` | stretch_controller.py:510 | List[SPOCObject] | All objects in scene |
+| `get_object()` | stretch_controller.py:694 | SPOCObject | Specific object metadata |
+| `get_object_position()` | stretch_controller.py:721 | Vector3 | Object XYZ position |
+| `get_visible_objects()` | stretch_controller.py:426 | List[str] | Visible object IDs (cached) |
+| `object_is_visible_in_camera()` | stretch_controller.py:500 | bool | Is object visible? |
+| `get_objects_of_synset_list()` | stretch_controller.py:642 | List[SPOCObject] | Objects matching synsets |
+| `get_all_objects_of_synset()` | stretch_controller.py:667 | List[SPOCObject] | All objects of type |
+| `get_objects_that_objects_are_on()` | stretch_controller.py:553 | Dict | What objects are on what |
+| `get_object_receptacle_synsets()` | stretch_controller.py:592 | List[str] | Receptacles holding object |
+
+#### **Manipulation State**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `get_objects_in_hand_sphere()` | stretch_controller.py:123 | List[str] | Pickupable object IDs |
+| `get_held_objects()` | stretch_controller.py:126 | List[str] | Currently held object IDs |
+| `get_arm_sphere_center()` | stretch_controller.py:129 | Vector3 | Hand sphere center position |
+| `get_wrist_center()` | stretch_controller.py:132 | Vector3 | Wrist joint position |
+| `get_arm_wrist_position()` | stretch_controller.py:912 | [x,y,z] | Wrist relative position |
+| `get_arm_wrist_absolute_position()` | stretch_controller.py:917 | [x,y,z] | Wrist world position |
+| `get_arm_wrist_rotation()` | stretch_controller.py:922 | float | Wrist rotation angle |
+| `get_arm_proprioception()` | stretch_controller.py:929 | [x,y,z,θ] | Full arm state |
+| `get_relative_stretch_current_arm_state()` | stretch_controller.py:240 | Dict | Arm state relative to base |
+
+#### **Agent State**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `get_current_agent_position()` | stretch_controller.py:621 | Vector3 | Agent XYZ position |
+| `get_current_agent_full_pose()` | stretch_controller.py:624 | Dict | Position + rotation + arm |
+| `get_agent_alignment_to_object()` | stretch_controller.py:730 | float | Rotation angle to object |
+| `get_agent_alignment_to_wall()` | stretch_controller.py:741 | float | Rotation angle to wall |
+| `get_objects_room_id_and_type()` | stretch_controller.py:1223 | (str, str) | Object's room ID and type |
+| `get_agent_room_id_and_type()` | stretch_controller.py:1231 | (str, str) | Agent's room ID and type |
+
+#### **Distance Calculations**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `agent_l2_distance_to_point()` | stretch_controller.py:146 | float | Agent-to-point L2 distance |
+| `agent_l2_distance_to_object()` | stretch_controller.py:155 | float | Agent-to-object L2 distance |
+| `dist_from_arm_to_obj()` | stretch_controller.py:137 | float | Arm-to-object distance |
+| `dist_from_arm_sphere_center_to_obj()` | stretch_controller.py:984 | float | Hand sphere-to-object |
+| `dist_from_arm_sphere_center_to_obj_colliders_closest_to_point()` | stretch_controller.py:991 | float | Hand-to-closest point on object |
+
+#### **Navigation & Path Planning**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `get_shortest_path_to_object()` | stretch_controller.py:936 | List[Vector3] | Waypoints to object |
+| `get_shortest_path_to_point()` | stretch_controller.py:1034 | List[Vector3] | Waypoints to point |
+| `get_shortest_path_to_room()` | stretch_controller.py:1187 | List[Vector3] | Waypoints to room |
+| `does_some_shortest_path_to_object_exist()` | stretch_controller.py:1007 | bool | Is object reachable? |
+| `get_reachable_positions()` | stretch_controller.py:751 | List[Vector3] | All reachable positions |
+| `get_closest_object_from_ids()` | stretch_controller.py:1107 | str | Closest object from list |
+| `get_nearest_wall_from_ids()` | stretch_controller.py:1131 | str | Nearest wall from list |
+| `find_closest_room_of_list()` | stretch_controller.py:1237 | str | Closest room from list |
+
+#### **Spatial Reasoning**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `get_candidate_points_in_room()` | stretch_controller.py:1159 | List[(x,z)] | Candidate positions in room |
+| `get_agent_dist_from_room_ids()` | stretch_controller.py:1262 | Dict[str,float] | Distances to multiple rooms |
+| `get_locations_on_receptacle()` | stretch_controller.py:613 | List | Valid positions on receptacle |
+
+#### **Scene & Visualization**
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `get_top_down_path_view()` | stretch_controller.py:300 | (image, path) | Bird's eye view with path |
+| `num_pixels_visible()` | stretch_controller.py:1081 | int | Pixels of object visible |
+| `is_object_visible_enough_for_interaction()` | stretch_controller.py:1097 | bool | Is object centered & visible? |
+
+---
+
+### 9.3 Safety Cost Functions (Complete)
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `is_corner_unsafe()` | abstract_task.py:479 | 0/1 | Detect corner trap |
+| `is_dangerous_objects()` | abstract_task.py:471 | (0/1, name) | Detect dangerous object contact |
+| `is_blind_spot_unsafe()` | abstract_task.py:504 | (0/1, list) | Detect blind collision |
+| `is_fragile_collection_unsafe()` | abstract_task.py:557 | (0/1, list) | Detect cluster disturbance |
+| `is_critical_objects()` | abstract_task.py:619 | (0/1, list) | Detect large movements |
+| `judge_cost_collided()` | abstract_task.py:403 | 0/1 | Detect robot collision |
+| `get_status_change_objects()` | abstract_task.py:531 | List | Objects that moved |
+| `judge_cost_obj()` | abstract_task.py:383 | bool | Did object state change? |
+| `get_seen_objects()` | abstract_task.py:524 | List[str] | Objects in camera view |
+| `get_cluster_of_objects()` | abstract_task.py:565 | List[List] | Cluster objects by proximity |
+
+---
+
+### 9.4 Action Execution Functions (Complete)
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `agent_step()` | stretch_controller.py:782 | Event | Execute action |
+| `step()` | stretch_controller.py:279 | Event | Low-level controller step |
+| `teleport_agent()` | stretch_controller.py:248 | Event | Teleport to position |
+| `reset()` | stretch_controller.py:372 | Event | Reset scene |
+| `calibrate_agent()` | stretch_controller.py:334 | None | Calibrate cameras/gripper |
+| `set_object_filter()` | stretch_controller.py:527 | Event | Filter visible objects |
+| `reset_object_filter()` | stretch_controller.py:535 | Event | Show all objects |
+
+---
+
+### 9.5 Utility Functions
+
+| Function | Location | Returns | Purpose |
+|----------|----------|---------|---------|
+| `reset_visibility_cache()` | stretch_controller.py:295 | None | Clear cached visibility |
+| `query_env()` | stretch_controller.py:630 | Any | Generic environment query |
+| `get_current_scene_json()` | stretch_controller.py:1259 | Dict | Current scene configuration |
+| `sufficient_agent_state_change()` | stretch_controller.py:770 | bool | Did agent move enough? |
+
+---
+
+## Part 10: SENSOR DATA FLOW
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  OBSERVATION GENERATION (Every Timestep)                         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                ┌─────────────┼─────────────┐
+                ▼             ▼             ▼
+┌────────────────────┐ ┌──────────────┐ ┌────────────────────┐
+│ Vision Sensors     │ │ State Sensors│ │ Task Sensors       │
+├────────────────────┤ ├──────────────┤ ├────────────────────┤
+│ - RawNavRGBSensor  │ │ - LastAction │ │ - TaskNLSpec       │
+│ - RawManipRGBSensor│ │   Success    │ │ - BBoxSensor       │
+│                    │ │ - AgentLoc   │ │ - TargetDistance   │
+│ Output:            │ │ - TimeStep   │ │ - Visible Count    │
+│   (384,224,3) RGB  │ │              │ │ - TaskSuccess      │
+│                    │ │ Output:      │ │                    │
+│                    │ │   Scalars &  │ │ Output:            │
+│                    │ │   Vectors    │ │   Structured data  │
+└────────────────────┘ └──────────────┘ └────────────────────┘
+                │             │             │
+                └─────────────┼─────────────┘
+                              ▼
+                 ┌─────────────────────────┐
+                 │ Observation Dictionary   │
+                 ├─────────────────────────┤
+                 │ {                        │
+                 │   "nav_rgb": [H,W,3],   │
+                 │   "manip_rgb": [H,W,3], │
+                 │   "arm_state": [4],     │
+                 │   "task_spec": bytes,   │
+                 │   "bbox": {...},        │
+                 │   "timestep": [1],      │
+                 │   ...                   │
+                 │ }                        │
+                 └─────────────────────────┘
+                              │
+                              ▼
+          ┌──────────────────────────────────────┐
+          │ Vision Encoder (DINOv2 / SigLIP)     │
+          │   RGB → Visual Embeddings            │
+          └──────────────────────────────────────┘
+                              │
+                              ▼
+          ┌──────────────────────────────────────┐
+          │ Transformer Model                     │
+          │   Embeddings + State → Actions        │
+          └──────────────────────────────────────┘
+```
+
+---
+
+## Part 11: SUMMARY TABLE - ALL FUNCTIONS BY CATEGORY
+
+### Rewards (9 functions)
+- Shaping functions: ObjectNav, Fetch, RoomVisit
+- Distance calculations for rewards
+- Judge functions per task type
+
+### Environment Observations (45+ functions)
+- Visual: RGB, depth, segmentation (7)
+- Objects: queries, positions, visibility (12)
+- Manipulation: arm state, held objects (9)
+- Agent state: position, room, alignment (7)
+- Navigation: paths, distances, reachability (10)
+
+### Sensors (40+ sensor classes)
+- Vision sensors (3)
+- Navigation sensors (20+)
+- Manipulation sensors (3)
+- Task sensors (10+)
+- Meta sensors (timestep, trajectory, etc.)
+
+### Safety Costs (10 functions)
+- Cost detectors (6 types)
+- Object tracking functions
+- State change detection
+
+### Actions (7 action categories)
+- Navigation: move, rotate
+- Manipulation: arm, wrist, pickup/drop
+- Meta: done, sub-done
+
+---
+
+## Conclusion
+
+This **complete analysis** covers:
+
+✅ **Reward Functions**: 3 reward shapers + task-specific judges
+✅ **Environment Functions**: 60+ observation, navigation, and query functions
+✅ **Sensor Functions**: 40+ sensor classes providing multimodal observations
+✅ **Safety Cost Functions**: 6 cost types + tracking mechanisms
+✅ **Action Functions**: Full action execution pipeline
+✅ **Integration**: How all components connect in the RL loop
+
+The SafeVLA system is a **comprehensive embodied AI framework** combining:
+- **Rich multimodal observations** (RGB, depth, language, proprioception)
+- **Sophisticated reward shaping** (task-specific + exploration)
+- **Multi-dimensional safety constraints** (6 types of violations)
+- **State-of-the-art models** (DINOv2, Transformers, Lagrangian PPO)
+
+This architecture enables training policies that are both **effective at task completion** and **safe in interactive environments**.
